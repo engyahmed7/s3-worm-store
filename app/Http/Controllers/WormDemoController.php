@@ -9,6 +9,7 @@ use App\Services\WormArchive;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rules\File;
 use Illuminate\View\View;
@@ -27,7 +28,7 @@ class WormDemoController extends Controller
             'endpoint' => config('filesystems.disks.minio.endpoint'),
             'lockMode' => $archive->lockMode(),
             'retentionDays' => $archive->retentionDays(),
-            'maxUploadKilobytes' => (int) config('worm.upload_max_kilobytes'),
+            'maxUploadKilobytes' => $this->maxUploadKilobytes(),
             'allowedMimes' => config('worm.allowed_mimes'),
             'files' => $reachable ? $archive->list() : [],
         ]);
@@ -35,20 +36,42 @@ class WormDemoController extends Controller
 
     public function store(Request $request, WormArchive $archive): RedirectResponse
     {
+        $file = $request->file('file');
+
+        if ($file instanceof UploadedFile && ! $file->isValid()) {
+            Log::warning('PHP rejected the upload before it reached MinIO.', [
+                'error' => $file->getError(),
+                'message' => $file->getErrorMessage(),
+                'client_name' => $file->getClientOriginalName(),
+                'upload_max_filesize' => ini_get('upload_max_filesize'),
+                'post_max_size' => ini_get('post_max_size'),
+            ]);
+        }
+
         $request->validate([
-            'file' => ['required', File::types(config('worm.allowed_mimes'))->max((int) config('worm.upload_max_kilobytes'))],
+            'file' => ['required', File::types(config('worm.allowed_mimes'))->max($this->maxUploadKilobytes())],
+        ], [
+            'file.uploaded' => 'PHP rejected this file before it reached MinIO. upload_max_filesize is '.ini_get('upload_max_filesize').' and post_max_size is '.ini_get('post_max_size').'. Use a smaller file, or raise those php.ini values.',
         ]);
 
         /** @var UploadedFile $file */
         $file = $request->file('file');
+
         $key = $this->keyForUpload($file);
         $contentType = $file->getMimeType() ?: 'application/octet-stream';
 
         try {
             $object = $archive->writeOnce($key, $file->get(), $contentType);
+            Log::info("Uploaded [{$object->key}] once. Version ".($object->versionId ?? 'n/a').'. Locked until '.$object->retainUntil.'.');
         } catch (ObjectAlreadyWrittenException $exception) {
+            Log::warning('Object already written: '.$exception->getMessage());
+
             return back()->withErrors(['file' => $exception->getMessage()]);
-        } catch (Throwable) {
+        } catch (Throwable $exception) {
+            Log::error('Error writing object: '.$exception->getMessage(), [
+                'exception' => $exception,
+            ]);
+
             return back()->withErrors(['file' => $this->storageError()]);
         }
 
@@ -122,5 +145,35 @@ class WormDemoController extends Controller
         }
 
         return 'uploads/'.$name.'.'.$extension;
+    }
+
+    private function maxUploadKilobytes(): int
+    {
+        return min(
+            (int) config('worm.upload_max_kilobytes'),
+            $this->iniKilobytes('upload_max_filesize'),
+            $this->iniKilobytes('post_max_size'),
+        );
+    }
+
+    private function iniKilobytes(string $directive): int
+    {
+        $value = strtolower(trim((string) ini_get($directive)));
+
+        if ($value === '' || $value === '-1') {
+            return PHP_INT_MAX;
+        }
+
+        $unit = $value[-1];
+        $number = (float) $value;
+
+        $bytes = match ($unit) {
+            'g' => (int) round($number * 1024 * 1024 * 1024),
+            'm' => (int) round($number * 1024 * 1024),
+            'k' => (int) round($number * 1024),
+            default => (int) $number,
+        };
+
+        return max(1, intdiv($bytes, 1024));
     }
 }
